@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, Loader2, MapPin, Search, Sparkles, Target, Check, ArrowLeft, Briefcase, Users, Save } from "lucide-react";
+import { ChevronRight, Loader2, MapPin, Search, Sparkles, Target, Check, ArrowLeft, Briefcase, Users, Save, X, FileText } from "lucide-react";
 import Modal, { FormField, PrimaryButton, TextArea, TextInput } from "./Modal";
 import { call } from "@/lib/api";
 
@@ -31,11 +31,15 @@ const EXAMPLES: Record<LeadSource, string> = {
     "Personal injury law firms in Miami, FL with at least 4-star ratings. Also include family lawyers and estate planning attorneys in the greater Miami area.",
 };
 
-// The in-progress new-campaign form is kept in the browser so a preview error
-// or an accidental close doesn't lose what you typed. Cleared once a campaign
-// is actually created.
+// Two layers of persistence, both in the browser:
+//  • DRAFT_KEY  — the single "working form" auto-saved as you type, so a
+//    preview error or accidental close never loses in-progress input.
+//  • DRAFTS_KEY — a library of named drafts you explicitly Save, so you can
+//    keep one per need (e.g. "DTC UK", "Dental Austin") and switch between them.
 const DRAFT_KEY = "agent_hq_outreach_wizard_draft";
+const DRAFTS_KEY = "agent_hq_outreach_wizard_drafts";
 type WizardDraft = { source: LeadSource; name: string; query: string; maxResults: number; description: string };
+type NamedDraft = WizardDraft & { id: string; label: string; updated_at: number };
 
 export default function OutreachWizard({ open, onClose, onCreated }: Props) {
   const [step, setStep] = useState<Step>("input");
@@ -49,8 +53,10 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [savedFlash, setSavedFlash] = useState(false);
   const [draftRestored, setDraftRestored] = useState(false);
+  const [drafts, setDrafts] = useState<NamedDraft[]>([]);
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
 
-  // Restore any saved draft when the wizard opens.
+  // Restore the working form + load the saved-drafts library when the wizard opens.
   useEffect(() => {
     if (!open) return;
     try {
@@ -67,11 +73,46 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
     } catch {
       // Corrupt/blocked storage — ignore and start fresh.
     }
+    try {
+      const rawList = localStorage.getItem(DRAFTS_KEY);
+      const list = rawList ? (JSON.parse(rawList) as NamedDraft[]) : [];
+      if (Array.isArray(list)) setDrafts(list.filter((d) => d && d.id && d.label));
+    } catch {
+      // ignore
+    }
     setStep("input");
     setPreview(null);
     setError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  function persistDrafts(list: NamedDraft[]) {
+    setDrafts(list);
+    try {
+      localStorage.setItem(DRAFTS_KEY, JSON.stringify(list));
+    } catch {
+      // ignore
+    }
+  }
+
+  // Load a named draft into the form.
+  function loadDraft(d: NamedDraft) {
+    setSource(d.source);
+    setName(d.name);
+    setQuery(d.query);
+    setMaxResults(d.maxResults);
+    setDescription(d.description);
+    setActiveDraftId(d.id);
+    setStep("input");
+    setPreview(null);
+    setError(null);
+    setDraftRestored(false);
+  }
+
+  function deleteDraft(id: string) {
+    persistDrafts(drafts.filter((d) => d.id !== id));
+    if (id === activeDraftId) setActiveDraftId(null);
+  }
 
   // Auto-save the form as you type. Only writes when there's real content, so
   // it never clobbers the saved draft with a blank form (e.g. during reset).
@@ -86,16 +127,26 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
     }
   }, [open, source, name, query, maxResults, description]);
 
-  function saveDraft() {
-    try {
-      const draft: WizardDraft = { source, name, query, maxResults, description };
-      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
-      setSavedFlash(true);
-      setDraftRestored(false);
-      setTimeout(() => setSavedFlash(false), 2500);
-    } catch {
-      setError("Couldn't save the draft — browser storage may be full or blocked.");
-    }
+  // Save the current form as a named draft in the library. Upserts by the
+  // active draft (if one is loaded) or by campaign name — so re-saving the
+  // same-named form updates it, and a new name creates a new draft.
+  function saveDraft(asNew = false) {
+    const label = name.trim() || query.trim().slice(0, 50) || "Untitled draft";
+    const now = Date.now();
+    const match = asNew
+      ? undefined
+      : drafts.find((d) => d.id === activeDraftId) ??
+        drafts.find((d) => d.label.toLowerCase() === label.toLowerCase());
+    const id = match?.id ?? `${now}-${Math.random().toString(36).slice(2, 7)}`;
+    const entry: NamedDraft = { id, label, source, name, query, maxResults, description, updated_at: now };
+    const next = match ? drafts.map((d) => (d.id === id ? entry : d)) : [entry, ...drafts];
+    // Newest first.
+    next.sort((a, b) => b.updated_at - a.updated_at);
+    persistDrafts(next);
+    setActiveDraftId(id);
+    setSavedFlash(true);
+    setDraftRestored(false);
+    setTimeout(() => setSavedFlash(false), 2500);
   }
 
   function clearDraft() {
@@ -159,7 +210,12 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
         source,
         description: description.trim(),
       });
-      clearDraft(); // campaign is now persisted server-side — drop the local draft
+      clearDraft(); // working form is now a real campaign — drop the scratch copy
+      // Also remove the matching named draft from the library, if one is active.
+      if (activeDraftId) {
+        persistDrafts(drafts.filter((d) => d.id !== activeDraftId));
+        setActiveDraftId(null);
+      }
       onCreated?.(campaign);
       close();
     } catch (err) {
@@ -225,7 +281,47 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
             </div>
           </div>
 
-          <FormField label="Campaign name" hint="For your own reference. Auto-derived if blank.">
+          {/* Saved-drafts library — click to load, × to delete. */}
+          {drafts.length > 0 && (
+            <div>
+              <div className="text-xs uppercase tracking-widest text-white/80 font-display font-bold mb-2 flex items-center gap-1.5">
+                <FileText size={12} /> Saved drafts ({drafts.length})
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {drafts.map((d) => {
+                  const active = d.id === activeDraftId;
+                  return (
+                    <div
+                      key={d.id}
+                      className={`group inline-flex items-center gap-1.5 rounded-lg border pl-3 pr-1.5 py-1.5 text-xs transition ${
+                        active ? "bg-primary/15 border-primary/50 text-white" : "bg-white/[0.03] border-white/10 text-white/75 hover:border-white/25"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => loadDraft(d)}
+                        className="max-w-[180px] truncate font-medium"
+                        title={`Load "${d.label}"`}
+                      >
+                        {active && <Check size={11} className="inline -mt-0.5 mr-1 text-primary" />}
+                        {d.label}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteDraft(d.id)}
+                        title="Delete draft"
+                        className="w-5 h-5 rounded flex items-center justify-center text-white/40 hover:text-red-300 hover:bg-red-500/15 transition"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <FormField label="Campaign name" hint="Names the draft too. Auto-derived if blank.">
             <TextInput
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -311,17 +407,28 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
                 </>
               )}
             </PrimaryButton>
-            {/* Save the form so a preview error or accidental close doesn't lose it. */}
+            {/* Save the form to your drafts library (upsert by name / active draft). */}
             <button
               type="button"
-              onClick={saveDraft}
+              onClick={() => saveDraft(false)}
               disabled={!name.trim() && !query.trim() && !description.trim()}
-              title="Save this form so you can come back to it — it's kept even if the preview errors"
+              title="Save this form as a named draft you can come back to and reuse"
               className="flex items-center gap-1.5 px-4 py-3 text-sm rounded-lg bg-white/5 hover:bg-white/10 border border-white/15 text-white/85 font-semibold transition disabled:opacity-40"
             >
               {savedFlash ? <Check size={14} className="text-green-400" /> : <Save size={14} />}
-              {savedFlash ? "Saved" : "Save draft"}
+              {savedFlash ? "Saved" : activeDraftId ? "Update draft" : "Save draft"}
             </button>
+            {/* When editing a loaded draft, allow branching it into a separate one. */}
+            {activeDraftId && (name.trim() || query.trim()) && (
+              <button
+                type="button"
+                onClick={() => saveDraft(true)}
+                title="Save as a separate new draft, keeping the original"
+                className="px-3 py-3 text-xs rounded-lg text-white/55 hover:text-white border border-white/10 hover:border-white/25 font-semibold transition"
+              >
+                Save as new
+              </button>
+            )}
             <button
               onClick={close}
               className="px-4 py-3 text-sm text-white/60 hover:text-white transition font-medium"
@@ -330,7 +437,7 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
             </button>
           </div>
           <p className="text-[11px] text-white/40 pt-1">
-            Your inputs are auto-saved as you type and restored next time — so an error won't lose them.
+            Save one draft per need (e.g. "DTC UK", "Dental Austin") — pick any from Saved drafts above. Your working form is also auto-saved so an error won't lose it.
           </p>
         </div>
       )}
