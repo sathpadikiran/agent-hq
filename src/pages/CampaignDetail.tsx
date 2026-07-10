@@ -67,6 +67,8 @@ type Campaign = {
   default_sender_name?: string | null;
   default_sender_company?: string | null;
   default_sender_offer?: string | null;
+  default_framework?: "one-off" | "pas" | "aida" | "sdr" | null;
+  default_sequence_total?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -893,6 +895,7 @@ export default function CampaignDetail() {
         open={generateModalOpen}
         onClose={() => setGenerateModalOpen(false)}
         campaignId={campaign.id}
+        campaign={campaign}
         leads={leads}
         existingEmails={emails}
         setBusyAction={setBusyAction}
@@ -1070,6 +1073,7 @@ function GenerateEmailsModal({
   open,
   onClose,
   campaignId,
+  campaign,
   leads,
   existingEmails,
   setBusyAction,
@@ -1081,6 +1085,7 @@ function GenerateEmailsModal({
   open: boolean;
   onClose: () => void;
   campaignId: string;
+  campaign: Campaign;
   leads: Lead[];
   existingEmails: EmailRow[];
   setBusyAction: (v: "run" | "generate" | "send" | null) => void;
@@ -1089,12 +1094,51 @@ function GenerateEmailsModal({
   progress: { done: number; total: number } | null;
   setProgress: (p: { done: number; total: number } | null) => void;
 }) {
-  const [senderName, setSenderName] = useState("");
-  const [senderCompany, setSenderCompany] = useState("");
-  const [senderOffer, setSenderOffer] = useState("");
-  const [framework, setFramework] = useState<Framework>("one-off");
+  // Pre-fill from the campaign's saved defaults so a returning user (or one
+  // recovering from a mid-generate error) doesn't have to retype everything.
+  const [senderName, setSenderName] = useState(campaign.default_sender_name ?? "");
+  const [senderCompany, setSenderCompany] = useState(campaign.default_sender_company ?? "");
+  const [senderOffer, setSenderOffer] = useState(campaign.default_sender_offer ?? "");
+  const [framework, setFramework] = useState<Framework>(campaign.default_framework ?? "one-off");
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
   const [localErr, setLocalErr] = useState<string | null>(null);
+
+  // Re-sync from saved defaults each time the modal opens — reflects anything
+  // persisted since the component first mounted (e.g. a prior Save or generate).
+  useEffect(() => {
+    if (!open) return;
+    setSenderName(campaign.default_sender_name ?? "");
+    setSenderCompany(campaign.default_sender_company ?? "");
+    setSenderOffer(campaign.default_sender_offer ?? "");
+    if (campaign.default_framework) setFramework(campaign.default_framework);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Persist the sender context + framework onto the campaign without drafting
+  // anything — so it survives navigation and errors.
+  async function saveDetails() {
+    setSaving(true);
+    setLocalErr(null);
+    try {
+      await call("outreach.campaign.update", {
+        id: campaignId,
+        default_sender_name: senderName.trim() || null,
+        default_sender_company: senderCompany.trim() || null,
+        default_sender_offer: senderOffer.trim() || null,
+        default_framework: framework,
+        default_sequence_total: framework === "one-off" ? 1 : 3,
+      });
+      setSavedFlash(true);
+      onComplete(); // refresh so campaign.default_* reflect the save
+      setTimeout(() => setSavedFlash(false), 2500);
+    } catch (e) {
+      setLocalErr(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const totalSteps = framework === "one-off" ? 1 : 3;
   const currentFramework = FRAMEWORK_OPTIONS.find((f) => f.value === framework)!;
@@ -1294,15 +1338,30 @@ function GenerateEmailsModal({
           <div className="rounded-lg bg-red-500/15 border border-red-500/40 px-4 py-2 text-sm text-red-200">{localErr}</div>
         )}
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <PrimaryButton type="submit" loading={busy} disabled={!senderOffer.trim() || busy || plannedCount === 0}>
             <Sparkles size={14} /> Generate {plannedCount} draft{plannedCount === 1 ? "" : "s"}
             {totalSteps > 1 && <span className="opacity-75">· {currentFramework.label.split(" ")[0]}</span>}
           </PrimaryButton>
+          {/* Save the sender context/framework without drafting — so it survives
+              navigation and errors, and pre-fills next time. */}
+          <button
+            type="button"
+            onClick={saveDetails}
+            disabled={saving || busy}
+            title="Save these details to the campaign so you don't have to re-enter them"
+            className="flex items-center gap-1.5 px-4 py-3 text-sm rounded-lg bg-white/5 hover:bg-white/10 border border-white/15 text-white/85 font-semibold transition disabled:opacity-50"
+          >
+            {saving ? <Loader2 size={14} className="animate-spin" /> : savedFlash ? <Check size={14} className="text-green-400" /> : null}
+            {savedFlash ? "Saved" : "Save details"}
+          </button>
           <button type="button" onClick={onClose} className="px-4 py-3 text-sm text-white/60 hover:text-white font-medium">
             {busy ? "Close (keeps running)" : "Cancel"}
           </button>
         </div>
+        <p className="text-[11px] text-white/40">
+          Your name, company, offer &amp; framework are saved to this campaign automatically after a successful generate — or click <span className="text-white/60 font-medium">Save details</span> to keep them without drafting.
+        </p>
       </form>
     </Modal>
   );
