@@ -3,6 +3,12 @@
   publish = "dist"
   functions = "netlify/functions"
 
+[build.environment]
+  # Pin the build + functions runtime so a fresh Netlify import builds
+  # deterministically (Node 22 LTS supports fetch / AbortSignal.timeout /
+  # base64url used by the functions).
+  NODE_VERSION = "22"
+
 [dev]
   command = "npm run dev:vite"
   port = 8888
