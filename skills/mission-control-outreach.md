@@ -6,9 +6,17 @@ human describes an ideal customer profile and wants outbound email to
 happen.
 
 **What it does:** Turns one natural-language sentence into a real
-outreach campaign — leads scraped from Google Maps, personalised emails
-drafted by Gemini, real emails sent via the user's own AgentMail inbox,
-with live tracking of delivered / bounced / clicked / replied events.
+outreach campaign. Two lead engines, picked per campaign:
+- **Apollo People Search (default)** — finds the right decision-maker at a
+  company by job title, plus their org and verified work email. This is the
+  "find a named person + verified email" path.
+- **Google Maps via Apify (fallback)** — finds local businesses by type +
+  location. Use for main-street/SMB targeting where you want the business,
+  not a named individual.
+
+Then Gemini drafts personalised emails, they send via the user's own
+AgentMail inbox, with live tracking of delivered / bounced / clicked /
+replied events.
 
 **Replaces:** Apollo ($99/mo), Instantly ($97/mo), Clay ($149/mo),
 Smartlead ($97/mo), plus an SDR making $60K+/yr.
@@ -18,8 +26,11 @@ Smartlead ($97/mo), plus an SDR making $60K+/yr.
 ## Setup — one-time
 
 The human installs AgentHQ from the one-click Netlify button, then pastes
-three keys (Gemini, Apify, AgentMail) in the onboarding wizard. That's
-your entire prerequisite. Env vars for you:
+their keys in the onboarding wizard: **Gemini** (preview + drafting),
+**Apollo** (primary lead engine — needs a master API key with People Search
+access), **AgentMail** (send + receive), and optionally **Apify** (only if
+they'll use the Google Maps fallback). That's your entire prerequisite.
+Env vars for you:
 
 ```
 AGENT_HQ_URL=<e.g. https://agent-hq.netlify.app>
@@ -44,34 +55,40 @@ Body:
 ```
 HUMAN                AGENT (you)                       UI SURFACE
 ─────                ───────────                       ──────────
-"Find me 20                                            /outreach wizard
- roofing
- contractors
- in Phoenix"   →     outreach.preview                  preview step
-                     → location + 3 search terms
-                     + maxResults
-               ←     "Location: Phoenix, AZ.
-                     Terms: roofing contractor,
-                     commercial roofer, solar
-                     roof installer. Green-light
-                     to spend Apify credits?"
-
-   — GATE 1 —
+"Find Heads of                                         /outreach wizard
+ CX at DTC
+ Shopify brands,
+ 11–200 emp"   →     outreach.preview (source:apollo)  preview step
+                     → person_titles[] +
+                       person_locations[] +
+                       num_employees_ranges[] +
+                       keyword_tags[]
+               ←     "Titles: Head of CX, VP CX.
+                     US, 11–200 emp, DTC/Shopify.
+                     Create + run the search?"
 
 "Go"           →     outreach.campaign.create          campaign card
-               →     outreach.campaign.run             status: searching
-                     [Apify runs ~30–120s]             → ready
-               ←     "20 leads imported."
+               →     outreach.campaign.run             (Apollo: instant)
+                     [Apollo search — free, sync]      status: ready
+               ←     "25 people found. Emails are
+                     locked until you reveal them."
 
-               →     outreach.emails.generate          drafts appear
+   — GATE 1 (credit spend) —
+
+"Reveal"       →     outreach.leads.enrich_one (loop)  email fills in
+                     [Apollo match — 1 credit each]
+               ←     "18 of 25 verified emails
+                     revealed (18 credits spent)."
+
+               →     outreach.emails.generate_one      drafts appear
                      [Gemini drafts N emails]
-               ←     "20 drafts ready. Review
+               ←     "18 drafts ready. Review
                      one or send all?"
 
    — GATE 2 —
 
 "Send all"     →     outreach.emails.send              sent counter ticks
-               ←     "Sent 20/20."
+               ←     "Sent 18/18."
 
                      [AgentMail webhooks fire]
                      → delivered counter ticks         live via webhook
@@ -83,7 +100,13 @@ HUMAN                AGENT (you)                       UI SURFACE
                      outreach.replies.convert_to_task  kanban card
 ```
 
-**You never skip Gate 1 (spending Apify credits).** You never skip
+**Where the money is spent depends on the engine:**
+- **Apollo:** search is *free*. The credit spend is the email **reveal**
+  (`enrich_one`), one credit per lead — that's Gate 1.
+- **Google Maps:** the **scrape** (`campaign.run`) spends Apify credits —
+  that's Gate 1 for that engine. Email enrichment (website scrape) is free.
+
+**You never skip Gate 1 (spending the human's credits).** You never skip
 Gate 2 (real emails to real people). Everything else is autonomous.
 
 ---
@@ -91,22 +114,33 @@ Gate 2 (real emails to real people). Everything else is autonomous.
 ## Full action catalog
 
 ### Natural-language preview
-- `outreach.preview` — Gemini converts a free-text ICP into
-  `{ location, searchTerms[], maxResults }`. No side effects — safe to
-  call repeatedly.
-  params: `{ query, max_results? }`
+- `outreach.preview` — Gemini converts a free-text ICP into a structured
+  query for the chosen engine. No side effects — safe to call repeatedly.
+  params: `{ query, max_results?, source? }`
+  - `source: "apollo"` (default) → `{ mode:"apollo", person_titles[],
+    person_locations[], organization_num_employees_ranges[] (e.g. "11,200"),
+    q_organization_keyword_tags[], per_page }`
+  - `source: "google_maps"` → `{ mode:"google_maps", location,
+    searchTerms[], maxResults }`
 
 ### Campaigns (the container)
 - `outreach.campaign.create` — persists a campaign. Pass the
-  `structured_query` you got from preview so the UI shows the plan.
-  params: `{ name, query, structured_query?, description? }`
+  `structured_query` you got from preview, and the same `source` so the
+  campaign runs the right engine (also inferred from the query's `mode`).
+  params: `{ name, query, structured_query?, source?, description? }`
 - `outreach.campaign.list` — all campaigns, newest first.
 - `outreach.campaign.get` — one campaign by id.
   params: `{ id }`
 - `outreach.campaign.update` — patch (e.g. rename).
   params: `{ id, ...patch }`
-- `outreach.campaign.run` — **fires Apify**. Blocks 30s–3min. Writes
-  one lead record per result. Only call after Gate 1.
+- `outreach.campaign.run` — runs the campaign's lead engine.
+  - **Apollo** (default): People Search is synchronous — this call returns
+    with the campaign already `ready` and people imported (emails locked).
+    Search is free; no gate needed to run it.
+  - **Google Maps**: starts the Apify scrape and returns immediately with
+    status `searching`; the UI polls `outreach.campaign.sync` to import
+    leads when the run finishes (30s–3min). This spends Apify credits —
+    only call after Gate 1.
   params: `{ id }`
 - `outreach.campaign.delete` — removes the campaign record. Leads &
   emails remain in storage but become unreachable via the UI.
@@ -122,12 +156,15 @@ Gate 2 (real emails to real people). Everything else is autonomous.
   🧪 TEST in the UI. ALWAYS offer this as a step if the human is
   piloting the flow for the first time.
   params: `{ campaign_id, email, name?, notes? }`
-- `outreach.leads.enrich_one` — **Important after an Apify import.**
-  Google Maps rarely returns emails (phone + website only, typically).
-  After leads import, loop this across every lead with a website but no
-  email. Each call fetches homepage + /contact + /contact-us and regex's
-  out email addresses. Recovers ~40–70% of the missing addresses. Fails
-  open — if a site blocks scraping, we move on.
+- `outreach.leads.enrich_one` — **reveals one lead's email.** Two paths,
+  auto-selected per lead:
+  - **Apollo leads** (have `apollo_id`): calls People Enrichment (`match`)
+    to unlock a verified work email. **Costs ~1 Apollo credit per revealed
+    record** — this is the Gate 1 spend for Apollo. Loop it only over the
+    leads the human approved revealing.
+  - **Google Maps leads** (have a `website`): scrapes homepage + /contact +
+    /contact-us for a contact email. Free, best-effort, recovers ~40–70%.
+  Fails open — if a lead can't be revealed, we move on.
   params: `{ campaign_id, lead_id }`
 - `outreach.leads.delete` — removes one lead.
   params: `{ campaign_id, lead_id }`
@@ -253,6 +290,15 @@ When you get to either gate, log an activity entry describing exactly
 what the human is about to approve, then stop and wait:
 
 ```
+// Apollo: the spend is the email reveal, not the search.
+activity.log {
+  category: "decision",
+  summary: "Apollo found 25 Heads of CX. About to reveal verified emails —
+            ~25 Apollo credits (1 per lead). Approve?",
+  details: { campaign_id, leads_to_reveal: 25 }
+}
+
+// Google Maps: the spend is the scrape.
 activity.log {
   category: "decision",
   summary: "About to run Apify scrape for Phoenix roofing contractors.
@@ -285,8 +331,12 @@ list directly — but recommend it first.
 
 - **`Gemini key not configured`** — direct the human to `/settings`
   (or `/outreach` for the onboarding wizard).
-- **`Apify key not configured`** — same.
+- **`Apollo key not configured`** — same. Only needed for Apollo campaigns.
+- **`Apify key not configured`** — same. Only needed for Google Maps campaigns.
 - **`AgentMail key not configured`** — same.
+- **Apollo 403 ("plan doesn't grant People Search API access")** — the
+  human's Apollo tier lacks API access. Tell them to either upgrade Apollo,
+  or recreate the campaign with the **Google Maps** lead source instead.
 - **Apify run fails** — the campaign is marked `failed` with the error
   in `error_message`. Offer to retry (`outreach.campaign.run` again) or
   simplify the query.
@@ -301,6 +351,43 @@ list directly — but recommend it first.
 
 ## End-to-end example (copy, adapt, send)
 
+### Apollo path (default) — named people + verified emails
+
+Human prompt: *"Find Heads of CX at DTC Shopify brands in the US, 11–200
+employees. Offer: we cut support ticket volume 30% with an AI triage layer.
+I'm Mani from Vertical AI."*
+
+```bash
+# 1. Preview → Apollo filters (no side effects, free)
+curl -X POST $AGENT_HQ_URL/api/command \
+  -H "Content-Type: application/json" -H "X-API-Key: $AGENT_HQ_KEY" \
+  -d '{"action":"outreach.preview","params":{"source":"apollo","query":"Head of CX at DTC Shopify brands in the US, 11-200 employees","max_results":25}}'
+# → { mode:"apollo", person_titles:["Head of CX","VP Customer Experience"], person_locations:["United States"], organization_num_employees_ranges:["11,200"], q_organization_keyword_tags:["DTC","Shopify"], per_page:25 }
+
+# 2. Create + 3. Run — Apollo search is synchronous & FREE, lands "ready"
+curl -X POST $AGENT_HQ_URL/api/command ... \
+  -d '{"action":"outreach.campaign.create","params":{"name":"DTC CX Leaders","source":"apollo","query":"Head of CX at DTC Shopify brands, 11-200 emp","structured_query":{"mode":"apollo","person_titles":["Head of CX","VP Customer Experience"],"person_locations":["United States"],"organization_num_employees_ranges":["11,200"],"q_organization_keyword_tags":["DTC","Shopify"],"per_page":25}}}'
+curl -X POST $AGENT_HQ_URL/api/command ... \
+  -d '{"action":"outreach.campaign.run","params":{"id":"CID"}}'
+# → { status:"ready", total_leads_found:25 }  (emails still locked)
+
+# ── GATE 1 (credit spend) ── approve revealing emails (~1 credit each) ──
+# (Human: "Reveal them")
+
+# 4. Reveal verified emails — loop enrich_one over every locked lead
+LEADS=$(curl -s -X POST $AGENT_HQ_URL/api/command ... \
+  -d '{"action":"outreach.leads.list","params":{"campaign_id":"CID"}}' \
+  | jq -r '.data[] | select(.email == null) | .id')
+for LEAD_ID in $LEADS; do
+  curl -X POST $AGENT_HQ_URL/api/command ... \
+    -d "{\"action\":\"outreach.leads.enrich_one\",\"params\":{\"campaign_id\":\"CID\",\"lead_id\":\"$LEAD_ID\"}}"
+done
+
+# 5. Draft (Gemini or write-your-own) then 6. Send — identical to below.
+```
+
+### Google Maps path (fallback) — local businesses
+
 Human prompt: *"Run outreach for dental clinics in Austin, TX, 4 stars
 and up. Offer is our no-show reduction product — we cut no-shows 40%
 with SMS reminders. I'm Mani from Vertical AI."*
@@ -309,8 +396,8 @@ with SMS reminders. I'm Mani from Vertical AI."*
 # 1. Preview (no side effects)
 curl -X POST $AGENT_HQ_URL/api/command \
   -H "Content-Type: application/json" -H "X-API-Key: $AGENT_HQ_KEY" \
-  -d '{"action":"outreach.preview","params":{"query":"dental clinics in Austin, TX, 4 stars and up","max_results":30}}'
-# → { location: "Austin, TX", searchTerms: ["dental clinic Austin TX", "family dentist Austin TX", "cosmetic dentist Austin TX"], maxResults: 30 }
+  -d '{"action":"outreach.preview","params":{"source":"google_maps","query":"dental clinics in Austin, TX, 4 stars and up","max_results":30}}'
+# → { mode:"google_maps", location: "Austin, TX", searchTerms: ["dental clinic Austin TX", "family dentist Austin TX", "cosmetic dentist Austin TX"], maxResults: 30 }
 
 # ── GATE 1 ── log decision, ask human to approve Apify spend ──
 curl -X POST $AGENT_HQ_URL/api/command \
@@ -321,7 +408,7 @@ curl -X POST $AGENT_HQ_URL/api/command \
 
 # 2. Create campaign
 curl -X POST $AGENT_HQ_URL/api/command ... \
-  -d '{"action":"outreach.campaign.create","params":{"name":"Austin Dentists · No-Show","query":"dental clinics in Austin, TX, 4 stars and up","structured_query":{"location":"Austin, TX","searchTerms":["dental clinic Austin TX","family dentist Austin TX","cosmetic dentist Austin TX"],"maxResults":30}}}'
+  -d '{"action":"outreach.campaign.create","params":{"name":"Austin Dentists · No-Show","source":"google_maps","query":"dental clinics in Austin, TX, 4 stars and up","structured_query":{"mode":"google_maps","location":"Austin, TX","searchTerms":["dental clinic Austin TX","family dentist Austin TX","cosmetic dentist Austin TX"],"maxResults":30}}}'
 # → { id: "abc123xyz", ... }
 
 # 3. Run scrape
@@ -399,10 +486,12 @@ curl -X POST $AGENT_HQ_URL/api/command ... \
 
 - **Sending without Gate 2.** Even if the human previously said "auto-send
   everything," confirm at the moment of send for each campaign.
-- **Scraping without Gate 1.** Apify costs real money — the human's money.
+- **Spending credits without Gate 1.** Revealing Apollo emails
+  (`enrich_one`) burns Apollo credits; running a Google Maps scrape burns
+  Apify credits. Both are the human's money — get approval first.
 - **Skipping `outreach.preview`** and going straight to `campaign.create`
   with a made-up `structured_query`. Preview is cheap and catches bad
-  briefs before they burn Apify budget.
+  briefs before they burn budget.
 - **Sending before generating drafts.** The UI forces draft → send
   separately on purpose — the human should see what's about to ship.
 

@@ -5,6 +5,7 @@ import {
   Target,
   Search,
   MapPin,
+  Briefcase,
   Trash2,
   AlertCircle,
   Mail,
@@ -24,12 +25,24 @@ import { call } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import outreachSkillMd from "../../skills/mission-control-outreach.md?raw";
 
+type ApolloQuery = {
+  mode: "apollo";
+  person_titles: string[];
+  person_locations: string[];
+  organization_num_employees_ranges: string[];
+  q_organization_keyword_tags: string[];
+  per_page: number;
+};
+type GoogleMapsQuery = { mode?: "google_maps"; location: string; searchTerms: string[]; maxResults: number };
+type StructuredQuery = ApolloQuery | GoogleMapsQuery;
+
 type Campaign = {
   id: string;
   name: string;
   query: string;
   description?: string;
-  structured_query: { location: string; searchTerms: string[]; maxResults: number } | null;
+  structured_query: StructuredQuery | null;
+  lead_source?: "apollo" | "google_maps";
   status: "draft" | "searching" | "ready" | "sending" | "completed" | "failed";
   total_leads_found: number;
   leads_imported: number;
@@ -73,7 +86,8 @@ export default function Outreach() {
   useEffect(() => {
     if (!loaded || !config) return;
     if (localStorage.getItem("agent_hq_outreach_onboarding_dismissed") === "1") return;
-    const missing = ["gemini", "apify", "agentmail"].some((k) => !config[k]?.configured);
+    // Apify is the optional Google Maps fallback — don't nag for it.
+    const missing = ["gemini", "apollo", "agentmail"].some((k) => !config[k]?.configured);
     if (missing) setOnboardingOpen(true);
   }, [loaded, config]);
 
@@ -110,7 +124,7 @@ export default function Outreach() {
 
   const missingKeys: string[] = [];
   if (config && !config.gemini?.configured) missingKeys.push("Gemini");
-  if (config && !config.apify?.configured) missingKeys.push("Apify");
+  if (config && !config.apollo?.configured) missingKeys.push("Apollo");
   if (config && !config.agentmail?.configured) missingKeys.push("AgentMail");
 
   const empty = loaded && campaigns.length === 0;
@@ -162,7 +176,7 @@ export default function Outreach() {
                 Connect {missingKeys.join(" + ")} to unlock the full flywheel
               </p>
               <p className="text-xs text-white/65">
-                Gemini powers the preview. Apify scrapes leads. AgentMail sends &amp; tracks. All free tier.
+                Gemini powers the preview. Apollo finds decision-makers &amp; verified emails. AgentMail sends &amp; tracks.
               </p>
             </div>
             <Link
@@ -242,26 +256,7 @@ export default function Outreach() {
 
                   <p className="text-sm text-white/70 italic line-clamp-2">"{c.query}"</p>
 
-                  {c.structured_query && (
-                    <div className="flex flex-wrap gap-1.5 items-center">
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-primary/10 border border-primary/25 text-primary text-[11px] font-mono">
-                        <MapPin size={10} /> {c.structured_query.location}
-                      </span>
-                      {c.structured_query.searchTerms.slice(0, 3).map((t, i) => (
-                        <span
-                          key={i}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-white/65 text-[11px] font-mono"
-                        >
-                          <Search size={10} /> {t}
-                        </span>
-                      ))}
-                      {c.structured_query.searchTerms.length > 3 && (
-                        <span className="text-[11px] text-white/40 font-mono">
-                          +{c.structured_query.searchTerms.length - 3}
-                        </span>
-                      )}
-                    </div>
-                  )}
+                  {c.structured_query && <QueryChips sq={c.structured_query} />}
 
                   <div className="flex items-center gap-4 text-[11px] text-white/55 font-mono pt-1">
                     <span>{c.leads_imported} leads</span>
@@ -315,6 +310,47 @@ export default function Outreach() {
         skillMarkdown={outreachSkillMd}
       />
     </>
+  );
+}
+
+// Renders the campaign's targeting summary as chips. Two shapes: Apollo
+// (titles + person locations + headcount bands) and Google Maps (location +
+// business search terms).
+function QueryChips({ sq }: { sq: StructuredQuery }) {
+  const chip = (icon: React.ReactNode, text: string, key: string, primary = false) => (
+    <span
+      key={key}
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono border ${
+        primary ? "bg-primary/10 border-primary/25 text-primary" : "bg-white/5 border-white/10 text-white/65"
+      }`}
+    >
+      {icon} {text}
+    </span>
+  );
+
+  if (sq.mode === "apollo") {
+    const titles = sq.person_titles ?? [];
+    const locs = sq.person_locations ?? [];
+    return (
+      <div className="flex flex-wrap gap-1.5 items-center">
+        {titles.slice(0, 3).map((t, i) => chip(<Briefcase size={10} />, t, `t${i}`, true))}
+        {titles.length > 3 && <span className="text-[11px] text-white/40 font-mono">+{titles.length - 3}</span>}
+        {locs.slice(0, 1).map((l, i) => chip(<MapPin size={10} />, l, `l${i}`))}
+        {(sq.organization_num_employees_ranges ?? []).slice(0, 1).map((r, i) =>
+          chip(<Users size={10} />, `${r.replace(",", "–")} emp`, `e${i}`),
+        )}
+      </div>
+    );
+  }
+
+  // Google Maps
+  const terms = sq.searchTerms ?? [];
+  return (
+    <div className="flex flex-wrap gap-1.5 items-center">
+      {chip(<MapPin size={10} />, sq.location, "loc", true)}
+      {terms.slice(0, 3).map((t, i) => chip(<Search size={10} />, t, `s${i}`))}
+      {terms.length > 3 && <span className="text-[11px] text-white/40 font-mono">+{terms.length - 3}</span>}
+    </div>
   );
 }
 

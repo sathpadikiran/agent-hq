@@ -41,8 +41,9 @@ const OUTREACH_EMAILS = "agent-hq-outreach-emails"; // key: `<campaign_id>/<emai
 const OUTREACH_REPLIES = "agent-hq-outreach-replies"; // inbound replies from AgentMail
 
 // Service keys we onboard. `gemini` doubles as the voice key — reads through VOICE_CONFIG for back-compat.
-type ServiceKey = "gemini" | "apify" | "agentmail";
-const SERVICE_KEYS: ServiceKey[] = ["gemini", "apify", "agentmail"];
+// `apollo` powers the People Search lead engine; `apify` (Google Maps) is the selectable fallback.
+type ServiceKey = "gemini" | "apollo" | "apify" | "agentmail";
+const SERVICE_KEYS: ServiceKey[] = ["gemini", "apollo", "apify", "agentmail"];
 
 type ServiceConfigRecord = { key: string; updated_at: string; last_test?: { ok: boolean; at: string; message?: string } };
 
@@ -95,6 +96,28 @@ async function testServiceKey(name: ServiceKey, key: string): Promise<{ ok: bool
       if (r.ok) return { ok: true, message: "Apify key verified" };
       const body = await r.text();
       return { ok: false, message: `Apify rejected key (${r.status}): ${body.slice(0, 120)}` };
+    }
+    if (name === "apollo") {
+      // Probe the actual People Search endpoint (per_page:1) rather than a
+      // generic auth ping. This is free (search consumes no credits) AND it
+      // reflects whether the caller's plan tier actually grants People Search
+      // API access — a valid key on a plan without API access 403s here, which
+      // is exactly what we want to surface at save time.
+      const r = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": key },
+        body: JSON.stringify({ page: 1, per_page: 1 }),
+      });
+      if (r.ok) return { ok: true, message: "Apollo key verified — People Search API access confirmed" };
+      const body = await r.text();
+      if (r.status === 403) {
+        return {
+          ok: false,
+          message:
+            "Apollo accepted the key but your plan doesn't grant People Search API access (403). Switch the campaign lead source to Google Maps, or upgrade your Apollo tier.",
+        };
+      }
+      return { ok: false, message: `Apollo rejected key (${r.status}): ${body.slice(0, 120)}` };
     }
     if (name === "agentmail") {
       // AgentMail "inboxes" list is a cheap authenticated GET.
@@ -248,12 +271,13 @@ type SequenceContext = {
 
 async function generateEmailDraft(
   geminiKey: string,
-  lead: { name?: string; company?: string; website?: string; category?: string; address?: string; notes?: string },
+  lead: { name?: string; title?: string; company?: string; website?: string; category?: string; address?: string; notes?: string },
   senderContext: { sender_name?: string; sender_company?: string; sender_offer?: string; campaign_query?: string },
   sequence: SequenceContext = {},
 ): Promise<EmailDraft> {
   const leadSummary = [
-    lead.name ? `Business: ${lead.name}` : null,
+    lead.name ? `Contact: ${lead.name}` : null,
+    lead.title ? `Title: ${lead.title}` : null,
     lead.company && lead.company !== lead.name ? `Company: ${lead.company}` : null,
     lead.category ? `Category: ${lead.category}` : null,
     lead.address ? `Location: ${lead.address}` : null,
@@ -512,15 +536,175 @@ function extractLeadFromApify(raw: Record<string, unknown>): {
   };
 }
 
+// ── Apollo helpers ────────────────────────────────────────────────────
+// Apollo People Search finds the *person* (by title) at a company plus their
+// org metadata — but NOT their email. Search is synchronous and free (no
+// credits). The email is unlocked by a separate People Enrichment ("match")
+// call, which costs one credit per revealed record — so we do that lazily,
+// per-lead, only when the user clicks "Find emails".
+
+type ApolloOrg = {
+  name?: string;
+  website_url?: string;
+  primary_domain?: string;
+  estimated_num_employees?: number;
+  industry?: string;
+  linkedin_url?: string;
+};
+
+type ApolloPerson = {
+  id?: string;
+  name?: string;
+  first_name?: string;
+  last_name?: string;
+  title?: string;
+  email?: string | null;
+  email_status?: string | null;
+  linkedin_url?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  organization?: ApolloOrg;
+  // Search results paginate but we pass through only the fields we read.
+};
+
+// A locked search result surfaces the email as "email_not_unlocked@domain.com"
+// — treat that (and empty/null) as "no email yet".
+function isRealEmail(email: string | null | undefined): email is string {
+  return !!email && email.includes("@") && !/email_not_unlocked/i.test(email);
+}
+
+async function apolloPeopleSearch(
+  apolloKey: string,
+  filters: ApolloFilters,
+  perPage: number,
+): Promise<ApolloPerson[]> {
+  const body: Record<string, unknown> = {
+    page: 1,
+    per_page: Math.max(1, Math.min(100, perPage)),
+  };
+  if (filters.person_titles?.length) body.person_titles = filters.person_titles;
+  if (filters.person_locations?.length) body.person_locations = filters.person_locations;
+  if (filters.organization_num_employees_ranges?.length)
+    body.organization_num_employees_ranges = filters.organization_num_employees_ranges;
+  if (filters.q_organization_keyword_tags?.length)
+    body.q_organization_keyword_tags = filters.q_organization_keyword_tags;
+
+  const r = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": apolloKey },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    if (r.status === 403) {
+      throw new Error(
+        "Apollo returned 403 — your plan doesn't grant People Search API access. Switch the campaign's lead source to Google Maps, or upgrade your Apollo tier.",
+      );
+    }
+    throw new Error(`Apollo search failed (${r.status}): ${txt.slice(0, 300)}`);
+  }
+  const data = (await r.json()) as { people?: ApolloPerson[]; contacts?: ApolloPerson[] };
+  // `people` is the primary array; `contacts` may hold already-owned records.
+  return [...(data.people ?? []), ...(data.contacts ?? [])];
+}
+
+// Reveal one person's email via People Enrichment. Consumes one Apollo credit
+// per record when data is returned. We pass the person's Apollo id (most
+// reliable match key); reveal_personal_emails stays false so we only spend on
+// business emails.
+async function apolloEnrichPerson(
+  apolloKey: string,
+  personId: string,
+): Promise<{ email: string | null; email_status: string | null }> {
+  const r = await fetch("https://api.apollo.io/api/v1/people/match", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": apolloKey },
+    body: JSON.stringify({ id: personId, reveal_personal_emails: false }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Apollo enrich failed (${r.status}): ${txt.slice(0, 200)}`);
+  }
+  const data = (await r.json()) as { person?: ApolloPerson };
+  const email = data.person?.email ?? null;
+  return {
+    email: isRealEmail(email) ? email : null,
+    email_status: data.person?.email_status ?? null,
+  };
+}
+
+function mapApolloPersonToLead(p: ApolloPerson): {
+  apollo_id: string | null;
+  name: string;
+  title: string | null;
+  company: string | null;
+  employee_count: number | null;
+  email: string | null;
+  phone: string | null;
+  website: string | null;
+  linkedin_url: string | null;
+  address: string | null;
+  category: string | null;
+  rating: number | null;
+  reviews_count: number | null;
+  maps_url: string | null;
+} {
+  const org = p.organization ?? {};
+  const fullName = p.name ?? [p.first_name, p.last_name].filter(Boolean).join(" ") ?? "Unknown";
+  const location = [p.city, p.state, p.country].filter(Boolean).join(", ") || null;
+  return {
+    apollo_id: p.id ?? null,
+    name: fullName || "Unknown",
+    title: p.title ?? null,
+    company: org.name ?? null,
+    employee_count: typeof org.estimated_num_employees === "number" ? org.estimated_num_employees : null,
+    email: isRealEmail(p.email) ? p.email : null, // usually locked at search time
+    phone: null, // Apollo phones need a separate async reveal — out of scope.
+    website: org.website_url ?? (org.primary_domain ? `https://${org.primary_domain}` : null),
+    linkedin_url: p.linkedin_url ?? null,
+    address: location,
+    category: org.industry ?? null,
+    // Google-Maps-only fields — kept null so the lead shape stays uniform.
+    rating: null,
+    reviews_count: null,
+    maps_url: null,
+  };
+}
+
 // ── OUTREACH helpers ───────────────────────────────────────────────
-// Turns a free-text ICP description into a structured query the Apify
-// Google Maps scraper can run. We ask Gemini for JSON only, validate the
-// shape, and fall back to a single literal search term if parsing fails
-// (so the preview always returns *something* usable).
+// Turns a free-text ICP description into a structured query one of our two
+// lead engines can run: Apollo People Search (filters) or the Apify Google
+// Maps scraper (location + search terms). We ask Gemini for JSON only,
+// validate the shape, and fall back to something usable if parsing fails.
+// The `mode` discriminator tells campaign.run which engine to use; campaigns
+// created before this field default to "google_maps".
 
-type StructuredQuery = { location: string; searchTerms: string[]; maxResults: number };
+type ApolloFilters = {
+  person_titles: string[];
+  person_locations: string[];
+  organization_num_employees_ranges: string[];
+  q_organization_keyword_tags: string[];
+};
 
-const PREVIEW_SYSTEM_PROMPT = `You convert a natural-language ICP description into a structured Google Maps search plan.
+type ApolloQuery = ApolloFilters & { mode: "apollo"; per_page: number };
+type GoogleMapsQuery = { mode: "google_maps"; location: string; searchTerms: string[]; maxResults: number };
+type StructuredQuery = ApolloQuery | GoogleMapsQuery;
+
+type LeadSource = "apollo" | "google_maps";
+
+// Back-compat: old campaigns stored { location, searchTerms, maxResults } with
+// no `mode`. Resolve the engine from an explicit lead_source, else the query's
+// mode, else assume Google Maps (the only engine that existed before Apollo).
+function resolveLeadSource(campaign: Record<string, unknown>): LeadSource {
+  const explicit = campaign.lead_source;
+  if (explicit === "apollo" || explicit === "google_maps") return explicit;
+  const sq = campaign.structured_query as { mode?: string } | null;
+  if (sq?.mode === "apollo") return "apollo";
+  return "google_maps";
+}
+
+const PREVIEW_GOOGLE_MAPS_PROMPT = `You convert a natural-language ICP description into a structured Google Maps search plan.
 
 Output ONLY a JSON object with this exact shape — no prose, no markdown, no code fences:
 { "location": "<city, state/country>", "searchTerms": ["<term 1>", "<term 2>", ...], "maxResults": <int> }
@@ -531,60 +715,81 @@ Rules:
 - "maxResults" = clamp the user-requested number into [10, 200]. If unspecified, use 50.
 - Always return valid JSON. No trailing commas. Double-quoted strings only.`;
 
-async function previewIcpWithGemini(geminiKey: string, userQuery: string, maxResultsHint?: number): Promise<StructuredQuery> {
+const PREVIEW_APOLLO_PROMPT = `You convert a natural-language ICP description into structured Apollo People Search filters. Apollo finds a specific decision-maker at a company by job title, location, and company attributes.
+
+Output ONLY a JSON object with this exact shape — no prose, no markdown, no code fences:
+{ "person_titles": ["<title>", ...], "person_locations": ["<location>", ...], "organization_num_employees_ranges": ["<min,max>", ...], "q_organization_keyword_tags": ["<keyword>", ...], "per_page": <int> }
+
+Rules:
+- "person_titles" = 1–5 job titles of the decision-maker to target. Use the exact titles the user named, and add close variants Apollo indexes (e.g. "Head of CX" -> "Head of Customer Experience", "VP Customer Experience", "Director of Customer Support"). If the user named no title, infer the most likely buyer for their offer.
+- "person_locations" = geographic targets for the PERSON, as Apollo expects them: city, state, or country strings (e.g. "United States", "California, US", "London, United Kingdom"). Empty array if the user gave no location.
+- "organization_num_employees_ranges" = company headcount bands as "min,max" strings (e.g. "11,200", "1,10", "201,500"). Map fuzzy phrasing: "SMB" -> "11,200", "mid-market" -> "201,1000", "enterprise" -> "1001,10000". Empty array if unspecified.
+- "q_organization_keyword_tags" = 1–5 keywords describing the COMPANY type / industry / niche the user described (e.g. "DTC", "Shopify", "ecommerce", "SaaS", "fintech"). Empty array if none implied.
+- "per_page" = how many people to fetch, clamped to [1, 100]. If the user requested a number, clamp it; if unspecified, use 25.
+- Always return valid JSON. No trailing commas. Double-quoted strings only. Every listed key must be present (use [] for empty).`;
+
+async function callGeminiJson(geminiKey: string, systemPrompt: string, userText: string): Promise<unknown> {
   const body = {
-    systemInstruction: { role: "system", parts: [{ text: PREVIEW_SYSTEM_PROMPT }] },
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: `ICP description:\n${userQuery}\n\nMax results hint: ${
-              typeof maxResultsHint === "number" ? maxResultsHint : "unspecified"
-            }`,
-          },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: 0.2,
-      responseMimeType: "application/json",
-    },
+    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+    generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
   };
   const r = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
   );
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`Gemini preview failed (${r.status}): ${txt.slice(0, 200)}`);
   }
-  const data = (await r.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-  };
+  const data = (await r.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   if (!text) throw new Error("Gemini returned empty response");
-
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
-    // Sometimes the model wraps in ```json fences despite the mime type —
-    // strip them and retry.
+    // Sometimes the model wraps in ```json fences despite the mime type.
     const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-    parsed = JSON.parse(stripped);
+    return JSON.parse(stripped);
   }
-  const obj = parsed as Partial<StructuredQuery>;
-  const location = typeof obj.location === "string" && obj.location.trim() ? obj.location.trim() : "Unknown";
-  const terms = Array.isArray(obj.searchTerms) ? obj.searchTerms.filter((t) => typeof t === "string" && t.trim()) : [];
-  const searchTerms = terms.length > 0 ? terms.map((t) => (t as string).trim()).slice(0, 5) : [userQuery.slice(0, 80)];
-  const rawMax = typeof obj.maxResults === "number" ? obj.maxResults : maxResultsHint ?? 50;
+}
+
+function toStringArray(v: unknown, max: number): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((t): t is string => typeof t === "string" && t.trim().length > 0).map((t) => t.trim()).slice(0, max);
+}
+
+async function previewIcpWithGemini(
+  geminiKey: string,
+  userQuery: string,
+  source: LeadSource,
+  maxResultsHint?: number,
+): Promise<StructuredQuery> {
+  const userText = `ICP description:\n${userQuery}\n\nMax results hint: ${
+    typeof maxResultsHint === "number" ? maxResultsHint : "unspecified"
+  }`;
+
+  if (source === "apollo") {
+    const parsed = (await callGeminiJson(geminiKey, PREVIEW_APOLLO_PROMPT, userText)) as Partial<ApolloQuery>;
+    const rawPer = typeof parsed.per_page === "number" ? parsed.per_page : maxResultsHint ?? 25;
+    const titles = toStringArray(parsed.person_titles, 5);
+    return {
+      mode: "apollo",
+      person_titles: titles.length > 0 ? titles : [userQuery.slice(0, 60)],
+      person_locations: toStringArray(parsed.person_locations, 5),
+      organization_num_employees_ranges: toStringArray(parsed.organization_num_employees_ranges, 5),
+      q_organization_keyword_tags: toStringArray(parsed.q_organization_keyword_tags, 5),
+      per_page: Math.max(1, Math.min(100, Math.round(rawPer))),
+    };
+  }
+
+  const parsed = (await callGeminiJson(geminiKey, PREVIEW_GOOGLE_MAPS_PROMPT, userText)) as Partial<GoogleMapsQuery>;
+  const location = typeof parsed.location === "string" && parsed.location.trim() ? parsed.location.trim() : "Unknown";
+  const terms = toStringArray(parsed.searchTerms, 5);
+  const searchTerms = terms.length > 0 ? terms : [userQuery.slice(0, 80)];
+  const rawMax = typeof parsed.maxResults === "number" ? parsed.maxResults : maxResultsHint ?? 50;
   const maxResults = Math.max(10, Math.min(200, Math.round(rawMax)));
-  return { location, searchTerms, maxResults };
+  return { mode: "google_maps", location, searchTerms, maxResults };
 }
 
 export const handler: Handler = async (event) => {
@@ -1084,16 +1289,19 @@ export const handler: Handler = async (event) => {
       // Phase 3 will wire the Apify run, AgentMail send, and reply ingestion.
 
       case "outreach.preview": {
-        // Turn free-text ICP into { location, searchTerms[], maxResults }.
-        // This is cheap and safe to call repeatedly — no side effects.
-        const { query, max_results } = params as Record<string, unknown>;
+        // Turn free-text ICP into a structured query for the chosen engine:
+        // Apollo filters (default) or Google Maps location + search terms.
+        // Cheap and safe to call repeatedly — no side effects.
+        const { query, max_results, source } = params as Record<string, unknown>;
         if (typeof query !== "string" || !query.trim()) return fail(400, "query required");
+        const leadSource: LeadSource = source === "google_maps" ? "google_maps" : "apollo";
         const geminiKey = await readServiceKey("gemini");
         if (!geminiKey) return fail(400, "Gemini key not configured — open Settings and add it first.");
         try {
           const structured = await previewIcpWithGemini(
             geminiKey,
             query.trim(),
+            leadSource,
             typeof max_results === "number" ? max_results : undefined,
           );
           return ok(structured);
@@ -1103,17 +1311,27 @@ export const handler: Handler = async (event) => {
       }
 
       case "outreach.campaign.create": {
-        const { name, query, structured_query, description } = params as Record<string, unknown>;
+        const { name, query, structured_query, description, source } = params as Record<string, unknown>;
         if (typeof name !== "string" || !name.trim()) return fail(400, "name required");
         if (typeof query !== "string" || !query.trim()) return fail(400, "query required");
         const id = nanoid(12);
         const now = new Date().toISOString();
+        const sq = (structured_query as StructuredQuery) ?? null;
+        // lead_source: explicit param wins, else infer from the structured
+        // query's mode, else default to Apollo (the primary engine).
+        const lead_source: LeadSource =
+          source === "google_maps" || source === "apollo"
+            ? source
+            : sq?.mode === "google_maps"
+            ? "google_maps"
+            : "apollo";
         const campaign = {
           id,
           name: name.trim(),
           query: query.trim(),
           description: typeof description === "string" ? description : "",
-          structured_query: (structured_query as StructuredQuery) ?? null,
+          structured_query: sq,
+          lead_source,
           status: "draft" as const, // draft | searching | ready | sending | completed | failed
           total_leads_found: 0,
           leads_imported: 0,
@@ -1173,10 +1391,13 @@ export const handler: Handler = async (event) => {
       }
 
       case "outreach.campaign.run": {
-        // Starts the Apify actor asynchronously and returns immediately.
-        // Netlify's ~26s function cap means we can't block on a scrape
-        // that typically runs 30s–3min. The client polls
-        // outreach.campaign.sync to drive the state transition to "ready".
+        // Two lead engines, picked by the campaign's lead_source:
+        //   • apollo (default) — People Search is synchronous and fast, so we
+        //     run it inline and land the campaign in "ready" within one call.
+        //     Emails come locked; the user reveals them later via "Find emails".
+        //   • google_maps — the Apify scraper runs 30s–3min, past Netlify's
+        //     ~26s cap, so we only START the run here and let the client poll
+        //     outreach.campaign.sync to import leads once it SUCCEEDS.
         const { id } = params as Record<string, string>;
         if (!id) return fail(400, "id required");
         const s = store(OUTREACH_CAMPAIGNS);
@@ -1184,19 +1405,90 @@ export const handler: Handler = async (event) => {
         if (!campaign) return fail(404, "campaign not found");
         const structured = campaign.structured_query as StructuredQuery | null;
         if (!structured) return fail(400, "campaign has no structured_query — run preview first");
+        const leadSource = resolveLeadSource(campaign);
+
+        // ── Apollo: synchronous People Search ──────────────────────────
+        if (leadSource === "apollo") {
+          const apolloKey = await readServiceKey("apollo");
+          if (!apolloKey) return fail(400, "Apollo key not configured — add it in Settings, or switch this campaign's lead source to Google Maps.");
+          const aq = structured as ApolloQuery;
+          try {
+            const people = await apolloPeopleSearch(
+              apolloKey,
+              {
+                person_titles: aq.person_titles ?? [],
+                person_locations: aq.person_locations ?? [],
+                organization_num_employees_ranges: aq.organization_num_employees_ranges ?? [],
+                q_organization_keyword_tags: aq.q_organization_keyword_tags ?? [],
+              },
+              aq.per_page ?? 25,
+            );
+            const leadsStore = store(OUTREACH_LEADS);
+            let imported = 0;
+            for (const person of people) {
+              const extracted = mapApolloPersonToLead(person);
+              const leadId = nanoid(10);
+              const createdAt = new Date().toISOString();
+              await writeJson(leadsStore, `${id}/${createdAt}-${leadId}`, {
+                id: leadId,
+                campaign_id: id,
+                ...extracted,
+                raw: person,
+                status: "new",
+                is_test: false,
+                tags: [],
+                created_at: createdAt,
+              });
+              imported++;
+            }
+            const existingLeadsBlobs = await leadsStore.list({ prefix: `${id}/` });
+            const totalAfter = existingLeadsBlobs.blobs.length;
+            const updated = {
+              ...campaign,
+              status: "ready" as const,
+              lead_source: "apollo" as const,
+              total_leads_found: people.length,
+              leads_imported: totalAfter,
+              error_message: null,
+              last_run_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            };
+            await writeJson(s, id, updated);
+            await logActivity({
+              agent_id: identity?.kind === "agent" ? identity.agent_id : null,
+              category: "research",
+              summary: `Apollo People Search: ${imported} people found for "${campaign.name}"`,
+              details: { campaign_id: id, imported },
+            });
+            return ok(updated);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Apollo search failed";
+            await writeJson(s, id, {
+              ...campaign,
+              status: "failed",
+              error_message: message,
+              updated_at: new Date().toISOString(),
+            });
+            return fail(500, message);
+          }
+        }
+
+        // ── Google Maps: start the async Apify run ─────────────────────
+        const gq = structured as GoogleMapsQuery;
         const apifyKey = await readServiceKey("apify");
         if (!apifyKey) return fail(400, "Apify key not configured");
 
         try {
           const run = await startApifyGoogleMapsRun(
             apifyKey,
-            structured.searchTerms,
-            structured.location,
-            structured.maxResults,
+            gq.searchTerms,
+            gq.location,
+            gq.maxResults,
           );
           const updated = {
             ...campaign,
             status: "searching" as const,
+            lead_source: "google_maps" as const,
             apify_run_id: run.runId,
             apify_dataset_id: run.defaultDatasetId,
             apify_status: run.status,
@@ -1251,7 +1543,9 @@ export const handler: Handler = async (event) => {
               await writeJson(s, id, { ...campaign, status: "failed", error_message: msg, apify_status: runStatus.status, updated_at: new Date().toISOString() });
               return fail(500, msg);
             }
-            const structured = campaign.structured_query as StructuredQuery;
+            // sync only runs for google_maps campaigns (Apollo never enters
+            // the "searching" state), so the query is always a GoogleMapsQuery.
+            const structured = campaign.structured_query as GoogleMapsQuery;
             const items = await getApifyDatasetItems(apifyKey, datasetId, structured.maxResults);
             const leadsStore = store(OUTREACH_LEADS);
             let imported = 0;
@@ -1396,10 +1690,15 @@ export const handler: Handler = async (event) => {
       }
 
       case "outreach.leads.enrich_one": {
-        // Scrapes the lead's website looking for a contact email. Runs
-        // one lead at a time so the UI can loop + show progress, and
-        // so we don't blow Netlify's 26s cap on a big campaign. Per-lead
-        // latency is usually 2–5s.
+        // Reveals one lead's email. Two paths, picked per-lead:
+        //   • Apollo leads (have apollo_id) → People Enrichment "match" call.
+        //     This unlocks a verified business email and COSTS one Apollo credit
+        //     per revealed record — which is why reveal is an explicit, per-lead
+        //     action the user triggers, never automatic.
+        //   • Google Maps leads (have a website, no apollo_id) → scrape the
+        //     site for a contact email (free, best-effort).
+        // Runs one lead at a time so the UI can loop + show progress and we
+        // stay well under Netlify's ~26s cap. Per-lead latency 1–5s.
         const { campaign_id, lead_id } = params as Record<string, string>;
         if (!campaign_id || !lead_id) return fail(400, "campaign_id and lead_id required");
         const leadsStore = store(OUTREACH_LEADS);
@@ -1416,6 +1715,34 @@ export const handler: Handler = async (event) => {
         }
         if (!lead || !storeKey) return fail(404, "lead not found");
         if (lead.email) return ok({ ...lead, already_had_email: true, enriched: false });
+
+        const apolloId = lead.apollo_id as string | undefined;
+
+        // ── Apollo reveal (consumes a credit) ──────────────────────────
+        if (apolloId) {
+          const apolloKey = await readServiceKey("apollo");
+          if (!apolloKey) return fail(400, "Apollo key not configured");
+          try {
+            const { email, email_status } = await apolloEnrichPerson(apolloKey, apolloId);
+            if (!email) {
+              return ok({ ...lead, enriched: false, reason: "Apollo had no unlockable email for this person" });
+            }
+            const updated = {
+              ...lead,
+              email,
+              email_status,
+              enriched_at: new Date().toISOString(),
+              enrichment_source: "apollo_match",
+              updated_at: new Date().toISOString(),
+            };
+            await writeJson(leadsStore, storeKey, updated);
+            return ok({ ...updated, enriched: true });
+          } catch (err) {
+            return fail(500, err instanceof Error ? err.message : "Apollo enrichment failed");
+          }
+        }
+
+        // ── Website scrape (Google Maps leads) ─────────────────────────
         const website = lead.website as string | undefined;
         if (!website) return ok({ ...lead, enriched: false, reason: "no website to scrape" });
 
@@ -1516,6 +1843,7 @@ export const handler: Handler = async (event) => {
             geminiKey,
             {
               name: lead.name as string | undefined,
+              title: lead.title as string | undefined,
               company: lead.company as string | undefined,
               website: lead.website as string | undefined,
               category: lead.category as string | undefined,
@@ -1676,7 +2004,7 @@ export const handler: Handler = async (event) => {
         const cs = store(OUTREACH_CAMPAIGNS);
         const campaign = await readJson<Record<string, unknown>>(cs, campaign_id);
         if (!campaign) return fail(404, "campaign not found");
-        const leads = await listJson<{ id: string; name: string; email: string | null; company?: string; website?: string; category?: string; address?: string; notes?: string }>(
+        const leads = await listJson<{ id: string; name: string; email: string | null; title?: string; company?: string; website?: string; category?: string; address?: string; notes?: string }>(
           store(OUTREACH_LEADS),
           `${campaign_id}/`,
         );
@@ -1692,6 +2020,7 @@ export const handler: Handler = async (event) => {
               geminiKey,
               {
                 name: lead.name,
+                title: lead.title,
                 company: lead.company,
                 website: lead.website,
                 category: lead.category,

@@ -22,6 +22,8 @@ import {
   Star,
   Phone,
   Globe,
+  Briefcase,
+  Linkedin,
   X,
 } from "lucide-react";
 import PageHeader from "@/components/PageHeader";
@@ -31,12 +33,24 @@ import AnimatedNumber from "@/components/AnimatedNumber";
 import { call } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
+type ApolloQuery = {
+  mode: "apollo";
+  person_titles: string[];
+  person_locations: string[];
+  organization_num_employees_ranges: string[];
+  q_organization_keyword_tags: string[];
+  per_page: number;
+};
+type GoogleMapsQuery = { mode?: "google_maps"; location: string; searchTerms: string[]; maxResults: number };
+type StructuredQuery = ApolloQuery | GoogleMapsQuery;
+
 type Campaign = {
   id: string;
   name: string;
   query: string;
   description?: string;
-  structured_query: { location: string; searchTerms: string[]; maxResults: number } | null;
+  structured_query: StructuredQuery | null;
+  lead_source?: "apollo" | "google_maps";
   status: string;
   total_leads_found: number;
   leads_imported: number;
@@ -61,6 +75,12 @@ type Lead = {
   id: string;
   name: string;
   email: string | null;
+  email_status?: string | null;
+  title?: string | null;
+  company?: string | null;
+  employee_count?: number | null;
+  linkedin_url?: string | null;
+  apollo_id?: string | null;
   phone: string | null;
   website: string | null;
   address: string | null;
@@ -256,7 +276,9 @@ export default function CampaignDetail() {
   // side so the progress bar reflects real per-lead latency.
   async function enrichEmails() {
     if (!id) return;
-    const targets = leads.filter((l) => !l.email && l.website);
+    // Apollo leads reveal via people/match (has apollo_id); Google Maps leads
+    // reveal via website scrape (has website).
+    const targets = leads.filter((l) => !l.email && (l.website || l.apollo_id));
     if (targets.length === 0) return;
     setEnrichProgress({ done: 0, total: targets.length, found: 0 });
     setErr(null);
@@ -341,6 +363,9 @@ export default function CampaignDetail() {
   }
 
   const structured = campaign.structured_query;
+  const leadSource: "apollo" | "google_maps" =
+    campaign.lead_source ?? (structured?.mode === "apollo" ? "apollo" : "google_maps");
+  const isApollo = leadSource === "apollo";
 
   return (
     <>
@@ -413,7 +438,31 @@ export default function CampaignDetail() {
             <Target size={20} className="text-primary" />
           </div>
           <div className="flex-1 space-y-2">
-            {structured && (
+            {structured && structured.mode === "apollo" && (
+              <>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Briefcase size={14} className="text-primary" />
+                  <span className="text-sm font-medium text-white">
+                    {structured.person_titles.slice(0, 2).join(", ")}
+                    {structured.person_titles.length > 2 ? ` +${structured.person_titles.length - 2}` : ""}
+                  </span>
+                  <span className="text-xs text-white/45">·</span>
+                  <span className="text-xs text-white/55 font-mono">up to {structured.per_page} people</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    ...structured.person_locations,
+                    ...structured.organization_num_employees_ranges.map((r) => `${r.replace(",", "–")} emp`),
+                    ...structured.q_organization_keyword_tags,
+                  ].map((t, i) => (
+                    <span key={i} className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-white/65 text-[11px] font-mono">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+            {structured && structured.mode !== "apollo" && (
               <>
                 <div className="flex items-center gap-2 flex-wrap">
                   <MapPin size={14} className="text-primary" />
@@ -454,14 +503,16 @@ export default function CampaignDetail() {
             campaign.status === "searching"
               ? "Scraping…"
               : counters && counters.leads > 0
-              ? "Re-run scrape"
-              : "Run Apify scrape"
+              ? isApollo ? "Re-run search" : "Re-run scrape"
+              : isApollo ? "Run Apollo search" : "Run Google Maps scrape"
           }
           sublabel={
             campaign.status === "searching"
               ? `Apify run ${campaign.apify_status?.toLowerCase() ?? "starting"} — results auto-import`
               : counters && counters.leads > 0
-              ? `${counters.leads} leads imported`
+              ? `${counters.leads} ${isApollo ? "people" : "leads"} imported`
+              : isApollo
+              ? "Find decision-makers by title via Apollo"
               : "Fetch real businesses from Google Maps"
           }
           icon={<Play size={16} />}
@@ -613,17 +664,19 @@ export default function CampaignDetail() {
           </div>
           <div className="flex items-center gap-2">
             {(() => {
-              const withoutEmail = leads.filter((l) => !l.email && l.website).length;
+              const withoutEmail = leads.filter((l) => !l.email && (l.website || l.apollo_id)).length;
               const enriching = enrichProgress !== null && enrichProgress.done < enrichProgress.total;
               if (withoutEmail === 0 && !enriching) return null;
+              const revealLabel = isApollo ? "Reveal emails" : "Find emails";
               return (
                 <button
                   onClick={enrichEmails}
                   disabled={enriching || withoutEmail === 0}
+                  title={isApollo ? "Unlocks verified emails via Apollo — costs ~1 credit per lead" : "Scrapes each lead's website for a contact email"}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 border border-primary/40 text-primary text-xs font-bold tracking-wide transition disabled:opacity-50"
                 >
                   {enriching ? <Loader2 size={13} className="animate-spin" /> : <Globe size={13} />}
-                  {enriching ? `Finding emails ${enrichProgress!.done}/${enrichProgress!.total}` : `Find emails (${withoutEmail})`}
+                  {enriching ? `${revealLabel} ${enrichProgress!.done}/${enrichProgress!.total}` : `${revealLabel} (${withoutEmail})`}
                 </button>
               );
             })()}
@@ -641,8 +694,8 @@ export default function CampaignDetail() {
             <Loader2 size={13} className={enrichProgress.done < enrichProgress.total ? "animate-spin text-primary" : "text-primary"} />
             <span className="text-xs text-primary font-mono flex-1">
               {enrichProgress.done < enrichProgress.total
-                ? `Scraping website ${enrichProgress.done + 1} of ${enrichProgress.total} · ${enrichProgress.found} email${enrichProgress.found === 1 ? "" : "s"} found so far`
-                : `Done · ${enrichProgress.found} of ${enrichProgress.total} sites gave us an email`}
+                ? `${isApollo ? "Revealing email" : "Scraping website"} ${enrichProgress.done + 1} of ${enrichProgress.total} · ${enrichProgress.found} found so far`
+                : `Done · ${enrichProgress.found} of ${enrichProgress.total} ${isApollo ? "revealed an email" : "sites gave us an email"}`}
             </span>
             <div className="w-28 h-1.5 rounded-full bg-white/5 overflow-hidden">
               <div
@@ -684,7 +737,10 @@ export default function CampaignDetail() {
                       )}
                     </div>
                     <div className="flex items-center gap-3 text-[11px] text-white/50 font-mono mt-0.5 flex-wrap">
-                      {l.email && <span className="text-white/70">{l.email}</span>}
+                      {l.title && <span className="text-white/75">{l.title}</span>}
+                      {l.company && <span>· {l.company}</span>}
+                      {typeof l.employee_count === "number" && l.employee_count > 0 && <span>· {l.employee_count} emp</span>}
+                      {l.email && <span className="text-white/70">· {l.email}</span>}
                       {l.category && <span>· {l.category}</span>}
                       {l.rating !== null && <span>· <Star size={9} className="inline -mt-0.5" /> {l.rating}{l.reviews_count ? ` (${l.reviews_count})` : ""}</span>}
                       {l.address && <span className="truncate max-w-[220px]">· {l.address}</span>}
@@ -700,6 +756,17 @@ export default function CampaignDetail() {
                         title={l.website}
                       >
                         <Globe size={12} />
+                      </a>
+                    )}
+                    {l.linkedin_url && (
+                      <a
+                        href={l.linkedin_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-8 h-8 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 text-white/70 hover:text-white flex items-center justify-center transition"
+                        title="View on LinkedIn"
+                      >
+                        <Linkedin size={12} />
                       </a>
                     )}
                     {l.maps_url && (
@@ -1049,7 +1116,8 @@ function GenerateEmailsModal({
   }
   const plannedCount = plannedPairs.length;
   const skippedNoEmail = leads.filter((l) => !l.email).length;
-  const skippedNoEmailButWebsite = leads.filter((l) => !l.email && l.website).length;
+  // Leads whose email can still be recovered — Apollo reveal (apollo_id) or website scrape.
+  const skippedNoEmailButWebsite = leads.filter((l) => !l.email && (l.website || l.apollo_id)).length;
   const skippedAlreadyDrafted = leadsWithEmail.length * totalSteps - plannedCount;
 
   async function submit(e: React.FormEvent) {
@@ -1180,9 +1248,9 @@ function GenerateEmailsModal({
           )}
           {skippedNoEmailButWebsite > 0 && (
             <div className="pt-2 mt-1 border-t border-white/5 text-[11px] text-white/60">
-              💡 Tip: {skippedNoEmailButWebsite} of those have websites. Close this and click
-              <span className="font-semibold text-primary"> Find emails </span>
-              in the Leads card to scrape them first — usually recovers 40–70%.
+              💡 Tip: {skippedNoEmailButWebsite} of those can still be recovered. Close this and use
+              <span className="font-semibold text-primary"> Reveal / Find emails </span>
+              in the Leads card first — Apollo unlocks verified emails, website scraping recovers 40–70%.
             </div>
           )}
           {skippedAlreadyDrafted > 0 && (
@@ -1246,13 +1314,28 @@ function LeadDetailModal({ lead, onClose }: { lead: Lead; onClose: () => void })
       open={true}
       onClose={onClose}
       title={lead.name}
-      description={lead.is_test ? "🧪 Test lead — seeded by you for the send→reply demo." : "Lead scraped by Apify from Google Maps."}
+      description={
+        lead.is_test
+          ? "🧪 Test lead — seeded by you for the send→reply demo."
+          : lead.apollo_id
+          ? "Person found via Apollo People Search."
+          : "Lead scraped by Apify from Google Maps."
+      }
       maxWidth="max-w-2xl"
     >
       <div className="space-y-4">
+        {/* Person / company block */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <DetailRow label="Title" value={lead.title ?? null} />
+          <DetailRow label="Company" value={lead.company ?? null} />
+          <DetailRow label="Company size" value={typeof lead.employee_count === "number" ? `${lead.employee_count} employees` : null} />
+          <DetailRow label="LinkedIn" value={lead.linkedin_url ? "View profile" : null} href={lead.linkedin_url ?? null} external />
+        </div>
+
         {/* Contact block */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           <DetailRow label="Email" value={lead.email} mono />
+          {lead.email_status && <DetailRow label="Email status" value={lead.email_status} />}
           <DetailRow label="Phone" value={lead.phone} mono href={lead.phone ? `tel:${lead.phone}` : null} />
           <DetailRow label="Website" value={lead.website} href={lead.website} external />
           <DetailRow label="Google Maps" value={lead.maps_url ? "View on Google Maps" : null} href={lead.maps_url} external />
@@ -1267,11 +1350,11 @@ function LeadDetailModal({ lead, onClose }: { lead: Lead; onClose: () => void })
 
         {lead.notes && <DetailRow label="Notes" value={lead.notes} full />}
 
-        {/* Raw Apify data — collapsed by default */}
+        {/* Raw source data — collapsed by default */}
         {lead.raw && Object.keys(lead.raw).length > 0 && (
           <details className="rounded-lg bg-black/30 border border-white/[0.06]">
             <summary className="cursor-pointer px-3 py-2 text-xs text-white/60 font-mono hover:text-white/85 transition">
-              Raw Apify data ({Object.keys(lead.raw).length} fields)
+              Raw source data ({Object.keys(lead.raw).length} fields)
             </summary>
             <pre className="px-3 pb-3 text-[10px] text-white/70 overflow-x-auto max-h-80 font-mono">
               {JSON.stringify(lead.raw, null, 2)}

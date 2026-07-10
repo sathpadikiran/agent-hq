@@ -3,7 +3,7 @@ import { Check, ExternalLink, Eye, EyeOff, Loader2, Sparkles } from "lucide-reac
 import Modal, { FormField, PrimaryButton, TextInput } from "./Modal";
 import { call } from "@/lib/api";
 
-type ServiceKey = "gemini" | "apify" | "agentmail";
+type ServiceKey = "gemini" | "apollo" | "apify" | "agentmail";
 
 type ConfigStatus = Record<
   ServiceKey,
@@ -38,11 +38,21 @@ const STEPS: Step[] = [
     placeholder: "AIza…",
   },
   {
+    service: "apollo",
+    title: "Apollo API Key",
+    eyebrow: "02 / Find",
+    tagline: "Finds the right decision-maker and their verified email.",
+    why: "The lead engine. Turns \"Head of CX at DTC Shopify brands, 11–200 employees\" into named people with titles, companies, and verified work emails. Needs a master API key with People Search access. Email reveal consumes ~1 Apollo credit per lead.",
+    getKeyUrl: "https://developer.apollo.io/keys/",
+    getKeyLabel: "Apollo Developer Settings",
+    placeholder: "…",
+  },
+  {
     service: "apify",
     title: "Apify API Token",
-    eyebrow: "02 / Scrape",
-    tagline: "Finds real businesses from your ICP description.",
-    why: "Runs the Google Maps scraper that turns \"dental clinics in Austin\" into 50 real leads with names, emails, and phones. Free tier: $5 credit on signup, ~12,500 leads.",
+    eyebrow: "03 / Fallback",
+    tagline: "Optional — Google Maps lead source for local businesses.",
+    why: "The fallback lead engine. If a campaign targets local businesses (\"dental clinics in Austin\") instead of named decision-makers, Apify scrapes Google Maps. Optional — skip it if you only use Apollo. Free tier: $5 credit on signup.",
     getKeyUrl: "https://console.apify.com/settings/integrations",
     getKeyLabel: "Apify Console",
     placeholder: "apify_api_…",
@@ -50,7 +60,7 @@ const STEPS: Step[] = [
   {
     service: "agentmail",
     title: "AgentMail API Key",
-    eyebrow: "03 / Send",
+    eyebrow: "04 / Send",
     tagline: "Inbox provisioned in seconds. Sends and receives.",
     why: "Each dashboard gets its own agent inbox. No domain, no DNS, no warmup. Send outreach, receive real replies, agent acts on them. Built for this use case.",
     getKeyUrl: "https://www.agentmail.to/",
@@ -153,7 +163,7 @@ export default function OnboardingWizard({ open, onClose, onlyMissing = true, on
       open={open}
       onClose={onClose}
       title="Connect your stack"
-      description="Three keys, all free tier. Paste, verify, done. Your keys live only in your own Netlify deployment."
+      description="Paste, verify, done. Your keys live only in your own Netlify deployment. Apify is optional — it's just the Google Maps fallback."
       maxWidth="max-w-2xl"
     >
       {/* Step indicator */}

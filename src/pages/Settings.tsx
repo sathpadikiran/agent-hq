@@ -5,7 +5,7 @@ import GlassCard from "@/components/GlassCard";
 import OnboardingWizard from "@/components/OnboardingWizard";
 import { call } from "@/lib/api";
 
-type ServiceKey = "gemini" | "apify" | "agentmail";
+type ServiceKey = "gemini" | "apollo" | "apify" | "agentmail";
 
 type ServiceStatus = {
   configured: boolean;
@@ -24,9 +24,16 @@ const SERVICE_META: Record<ServiceKey, { title: string; summary: string; url: st
     urlLabel: "Google AI Studio",
     accent: "from-primary/20 to-primary/5 border-primary/30",
   },
+  apollo: {
+    title: "Apollo",
+    summary: "People Search — decision-makers + verified emails",
+    url: "https://developer.apollo.io/keys/",
+    urlLabel: "Apollo Developer Settings",
+    accent: "from-primary/20 to-primary/5 border-primary/30",
+  },
   apify: {
     title: "Apify",
-    summary: "Google Maps scraper for leads",
+    summary: "Google Maps scraper — optional fallback lead source",
     url: "https://console.apify.com/settings/integrations",
     urlLabel: "Apify Console",
     accent: "from-purple/20 to-purple/5 border-purple/30",
@@ -84,7 +91,7 @@ export default function Settings() {
     }
   }
 
-  const services: ServiceKey[] = ["gemini", "apify", "agentmail"];
+  const services: ServiceKey[] = ["gemini", "apollo", "apify", "agentmail"];
   const missing = services.filter((s) => !status?.[s]?.configured);
 
   return (
