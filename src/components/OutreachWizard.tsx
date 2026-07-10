@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ChevronRight, Loader2, MapPin, Search, Sparkles, Target, Check, ArrowLeft, Briefcase, Users } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronRight, Loader2, MapPin, Search, Sparkles, Target, Check, ArrowLeft, Briefcase, Users, Save } from "lucide-react";
 import Modal, { FormField, PrimaryButton, TextArea, TextInput } from "./Modal";
 import { call } from "@/lib/api";
 
@@ -31,6 +31,12 @@ const EXAMPLES: Record<LeadSource, string> = {
     "Personal injury law firms in Miami, FL with at least 4-star ratings. Also include family lawyers and estate planning attorneys in the greater Miami area.",
 };
 
+// The in-progress new-campaign form is kept in the browser so a preview error
+// or an accidental close doesn't lose what you typed. Cleared once a campaign
+// is actually created.
+const DRAFT_KEY = "agent_hq_outreach_wizard_draft";
+type WizardDraft = { source: LeadSource; name: string; query: string; maxResults: number; description: string };
+
 export default function OutreachWizard({ open, onClose, onCreated }: Props) {
   const [step, setStep] = useState<Step>("input");
   const [source, setSource] = useState<LeadSource>("apollo");
@@ -41,6 +47,65 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
   const [preview, setPreview] = useState<StructuredQuery | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [draftRestored, setDraftRestored] = useState(false);
+
+  // Restore any saved draft when the wizard opens.
+  useEffect(() => {
+    if (!open) return;
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      if (raw) {
+        const d = JSON.parse(raw) as Partial<WizardDraft>;
+        if (d.source === "apollo" || d.source === "google_maps") setSource(d.source);
+        if (typeof d.name === "string") setName(d.name);
+        if (typeof d.query === "string") setQuery(d.query);
+        if (typeof d.maxResults === "number") setMaxResults(d.maxResults);
+        if (typeof d.description === "string") setDescription(d.description);
+        setDraftRestored(Boolean((d.name && d.name.trim()) || (d.query && d.query.trim()) || (d.description && d.description.trim())));
+      }
+    } catch {
+      // Corrupt/blocked storage — ignore and start fresh.
+    }
+    setStep("input");
+    setPreview(null);
+    setError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Auto-save the form as you type. Only writes when there's real content, so
+  // it never clobbers the saved draft with a blank form (e.g. during reset).
+  useEffect(() => {
+    if (!open) return;
+    if (!name.trim() && !query.trim() && !description.trim()) return;
+    try {
+      const draft: WizardDraft = { source, name, query, maxResults, description };
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    } catch {
+      // Storage full/blocked — non-fatal.
+    }
+  }, [open, source, name, query, maxResults, description]);
+
+  function saveDraft() {
+    try {
+      const draft: WizardDraft = { source, name, query, maxResults, description };
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+      setSavedFlash(true);
+      setDraftRestored(false);
+      setTimeout(() => setSavedFlash(false), 2500);
+    } catch {
+      setError("Couldn't save the draft — browser storage may be full or blocked.");
+    }
+  }
+
+  function clearDraft() {
+    try {
+      localStorage.removeItem(DRAFT_KEY);
+    } catch {
+      // ignore
+    }
+    setDraftRestored(false);
+  }
 
   function reset() {
     setStep("input");
@@ -94,6 +159,7 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
         source,
         description: description.trim(),
       });
+      clearDraft(); // campaign is now persisted server-side — drop the local draft
       onCreated?.(campaign);
       close();
     } catch (err) {
@@ -209,13 +275,31 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
             </FormField>
           </div>
 
+          {draftRestored && (
+            <div className="flex items-center justify-between gap-3 rounded-lg bg-primary/[0.07] border border-primary/25 px-3 py-2">
+              <span className="text-xs text-primary/90 flex items-center gap-1.5">
+                <Save size={12} /> Restored your saved draft.
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  clearDraft();
+                  reset();
+                }}
+                className="text-[11px] text-white/50 hover:text-white font-medium transition"
+              >
+                Start fresh
+              </button>
+            </div>
+          )}
+
           {error && (
             <div className="rounded-lg bg-red-500/15 border border-red-500/40 px-4 py-3 text-sm text-red-200">
               {error}
             </div>
           )}
 
-          <div className="flex items-center gap-3 pt-2">
+          <div className="flex items-center gap-3 pt-2 flex-wrap">
             <PrimaryButton onClick={runPreview} disabled={!query.trim() || busy} loading={busy}>
               {busy ? (
                 <>
@@ -227,6 +311,17 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
                 </>
               )}
             </PrimaryButton>
+            {/* Save the form so a preview error or accidental close doesn't lose it. */}
+            <button
+              type="button"
+              onClick={saveDraft}
+              disabled={!name.trim() && !query.trim() && !description.trim()}
+              title="Save this form so you can come back to it — it's kept even if the preview errors"
+              className="flex items-center gap-1.5 px-4 py-3 text-sm rounded-lg bg-white/5 hover:bg-white/10 border border-white/15 text-white/85 font-semibold transition disabled:opacity-40"
+            >
+              {savedFlash ? <Check size={14} className="text-green-400" /> : <Save size={14} />}
+              {savedFlash ? "Saved" : "Save draft"}
+            </button>
             <button
               onClick={close}
               className="px-4 py-3 text-sm text-white/60 hover:text-white transition font-medium"
@@ -234,6 +329,9 @@ export default function OutreachWizard({ open, onClose, onCreated }: Props) {
               Cancel
             </button>
           </div>
+          <p className="text-[11px] text-white/40 pt-1">
+            Your inputs are auto-saved as you type and restored next time — so an error won't lose them.
+          </p>
         </div>
       )}
 
