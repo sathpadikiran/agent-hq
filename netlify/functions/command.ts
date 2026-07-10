@@ -327,17 +327,7 @@ async function generateEmailDraft(
     ],
     generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
   };
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
-  );
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Gemini draft failed (${r.status}): ${txt.slice(0, 200)}`);
-  }
-  const data = (await r.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  if (!text) throw new Error("Gemini returned empty draft");
+  const text = await geminiGenerateContent(geminiKey, body, "Gemini draft");
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -733,23 +723,48 @@ Rules:
 - "per_page" = how many people to fetch, clamped to [1, 100]. If the user requested a number, clamp it; if unspecified, use 25.
 - Always return valid JSON. No trailing commas. Double-quoted strings only. Every listed key must be present (use [] for empty).`;
 
+// POST to Gemini generateContent with retry on transient failures. Gemini's
+// flash models periodically return 503 ("high demand"/UNAVAILABLE) or 429
+// during spikes — these are momentary, so we back off and retry a couple of
+// times before surfacing the error. Non-transient failures (401/400/404)
+// fail fast. Returns the model's text output (the first candidate part).
+async function geminiGenerateContent(geminiKey: string, body: unknown, label: string): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+  const transient = new Set([429, 500, 503]);
+  let lastErr = "unknown error";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 700 * attempt)); // 0.7s, 1.4s backoff
+    let r: Response;
+    try {
+      r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : "network error";
+      continue; // network blip — retry
+    }
+    if (r.ok) {
+      const data = (await r.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      if (!text) throw new Error(`${label}: Gemini returned empty response`);
+      return text;
+    }
+    const txt = await r.text();
+    lastErr = `${r.status}: ${txt.slice(0, 200)}`;
+    if (!transient.has(r.status)) break; // non-transient — don't waste retries
+  }
+  // Give the 503 case a friendlier hint since it's the common transient one.
+  if (lastErr.startsWith("503") || /UNAVAILABLE|high demand/i.test(lastErr)) {
+    throw new Error(`${label}: Gemini is temporarily overloaded (503). Please try again in a moment.`);
+  }
+  throw new Error(`${label} failed (${lastErr})`);
+}
+
 async function callGeminiJson(geminiKey: string, systemPrompt: string, userText: string): Promise<unknown> {
   const body = {
     systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: [{ text: userText }] }],
     generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
   };
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
-  );
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Gemini preview failed (${r.status}): ${txt.slice(0, 200)}`);
-  }
-  const data = (await r.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  if (!text) throw new Error("Gemini returned empty response");
+  const text = await geminiGenerateContent(geminiKey, body, "Gemini preview");
   try {
     return JSON.parse(text);
   } catch {
