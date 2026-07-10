@@ -45,6 +45,11 @@ const OUTREACH_REPLIES = "agent-hq-outreach-replies"; // inbound replies from Ag
 type ServiceKey = "gemini" | "apollo" | "apify" | "agentmail";
 const SERVICE_KEYS: ServiceKey[] = ["gemini", "apollo", "apify", "agentmail"];
 
+// Gemini model for preview + drafting. Use the `-latest` alias so Google's
+// periodic model retirements (e.g. gemini-2.5-flash 404'd for new users in
+// mid-2026) don't break us — the alias always resolves to the current flash.
+const GEMINI_MODEL = "gemini-flash-latest";
+
 type ServiceConfigRecord = { key: string; updated_at: string; last_test?: { ok: boolean; at: string; message?: string } };
 
 // Redact a stored key for display — keep first 4 and last 4 chars so the
@@ -323,7 +328,7 @@ async function generateEmailDraft(
     generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
   };
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
   );
   if (!r.ok) {
@@ -735,7 +740,7 @@ async function callGeminiJson(geminiKey: string, systemPrompt: string, userText:
     generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
   };
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
   );
   if (!r.ok) {
